@@ -15,6 +15,7 @@ import {
   initiateGoogleLogin,
   logoutFromGoogle
 } from '../services/google.service';
+import CallerIdSelector from './CallerIdSelector.vue';
 
 const props = defineProps({
   conversations: {
@@ -25,6 +26,10 @@ const props = defineProps({
     type: String,
     default: null
   },
+  isLoadingContacts: {
+    type: Boolean,
+    default: false
+  }
 });
 
 const emit = defineEmits(['select', 'refreshMessages', 'filter', 'markAllAsRead']);
@@ -40,6 +45,8 @@ const phoneToSend = ref('');
 const messageToSend = ref('');
 const searchQuery = ref('');
 const showActionsMenu = ref(false);
+const selectedCallerId = ref('');
+const showCallerIdSelector = ref(false);
 
 const googleStatus = ref({
   isAuthenticated: false,
@@ -177,6 +184,7 @@ const resetNewMessageForm = () => {
   phoneToSend.value = '';
   messageToSend.value = '';
   loading.value = false;
+  selectedCallerId.value = '';
   newMessageDialogVisible.value = false;
 };
 
@@ -186,9 +194,15 @@ async function sendNewMessage() {
   loading.value = true;
 
   try {
-    const response = await fetch(
-      `https://www.call2all.co.il/ym/api/SendSms?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&phones=${phoneToSend.value}&message=${messageToSend.value}`
-    );
+    // בנה את ה-URL עם הזיהוי יוצא
+    let url = `https://www.call2all.co.il/ym/api/SendSms?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&phones=${phoneToSend.value}&message=${messageToSend.value}`;
+    
+    // הוסף את הזיהוי יוצא אם נבחר
+    if (selectedCallerId.value) {
+      url += `&from=${selectedCallerId.value}`;
+    }
+
+    const response = await fetch(url);
 
     const data = await response.json();
 
@@ -204,6 +218,12 @@ async function sendNewMessage() {
     loading.value = false;
   }
 }
+
+// פונקציה לטיפול בבחירת זיהוי יוצא
+const handleCallerIdSelect = (callerId) => {
+  selectedCallerId.value = callerId;
+  showCallerIdSelector.value = false;
+};
 
 const toggleFilter = () => {
   filter.value = !filter.value;
@@ -245,10 +265,14 @@ onMounted(() => {
       <div class="flex items-center gap-2">
         <!-- Google Auth Button -->
         <button @click="googleStatus.isAuthenticated ? handleGoogleLogout() : handleGoogleLogin()"
+          :disabled="isLoadingContacts"
           class="p-1.5 rounded-full border transition-all hover:bg-gray-100 hover:border-gray-300"
-          :class="googleStatus.isAuthenticated ? 'border-green-500 bg-green-50 hover:bg-green-50 hover:border-green-500' : 'border-transparent'"
+          :class="[
+            googleStatus.isAuthenticated ? 'border-green-500 bg-green-50 hover:bg-green-50 hover:border-green-500' : 'border-transparent',
+            isLoadingContacts ? 'opacity-50 cursor-not-allowed' : ''
+          ]"
           title="התחבר עם Google לסנכרון אנשי קשר">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" class="w-6 h-6">
+          <svg v-if="!isLoadingContacts" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" class="w-6 h-6">
             <path fill="#FFC107"
               d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.08,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z">
             </path>
@@ -260,6 +284,12 @@ onMounted(() => {
             </path>
             <path fill="#1976D2"
               d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z">
+            </path>
+          </svg>
+          <svg v-else class="animate-spin w-6 h-6 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
             </path>
           </svg>
         </button>
@@ -313,9 +343,20 @@ onMounted(() => {
           class="font-semibold text-indigo-700">
           {{ googleStatus.userEmail }}
         </a>
-        <span class="text-gray-600">
-          {{ googleStatus.contactCount }} אנשי קשר
-        </span>
+        <div class="flex items-center gap-2">
+          <span v-if="isLoadingContacts" class="text-indigo-600 flex items-center gap-1">
+            <svg class="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z">
+              </path>
+            </svg>
+            טוען...
+          </span>
+          <span class="text-gray-600">
+            {{ googleStatus.contactCount }} אנשי קשר
+          </span>
+        </div>
       </div>
     </div>
 
@@ -419,6 +460,26 @@ onMounted(() => {
             </span>
           </label>
 
+          <!-- Caller ID Selection -->
+          <div class="space-y-2">
+            <label class="block text-sm font-medium text-gray-700">זיהוי יוצא</label>
+            <div class="flex items-center space-x-2 space-x-reverse">
+              <input 
+                v-model="selectedCallerId" 
+                type="text" 
+                placeholder="בחר זיהוי יוצא..."
+                class="flex-1 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                readonly
+                dir="rtl"
+              />
+              <button 
+                @click="showCallerIdSelector = true"
+                class="px-3 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 transition text-sm">
+                בחר
+              </button>
+            </div>
+          </div>
+
           <label for="message"
             class="relative block overflow-hidden rounded-lg border border-gray-200 px-3 pt-3 shadow-sm focus-within:border-indigo-600 focus-within:ring-1 focus-within:ring-indigo-600 transition-colors bg-white">
             <textarea v-model="messageToSend" id="message" placeholder="הודעה"
@@ -451,6 +512,14 @@ onMounted(() => {
       </div>
     </div>
   </transition>
+
+  <!-- Caller ID Selector Modal -->
+  <CallerIdSelector 
+    :visible="showCallerIdSelector"
+    :selected-caller-id="selectedCallerId"
+    @close="showCallerIdSelector = false"
+    @select="handleCallerIdSelect"
+  />
 </template>
 
 <style scoped>

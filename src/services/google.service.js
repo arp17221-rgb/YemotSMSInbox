@@ -5,7 +5,6 @@
 
 // Constants for Google authentication
 const CLIENT_ID = '293453062070-ne2pf11bn93mjr9mka97i484rb150vlt.apps.googleusercontent.com';
-// עדכון הסקופים לכלול גישה לאימייל
 const SCOPES = 'https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/userinfo.email';
 const DISCOVERY_DOC = 'https://people.googleapis.com/$discovery/rest?version=v1';
 
@@ -282,61 +281,90 @@ export async function fetchUserInfo(token) {
  */
 export async function fetchGoogleContacts(token) {
   try {
-    // Make the request to Google People API with explicit token in headers
-    const response = await gapi.client.request({
-      path: 'https://people.googleapis.com/v1/people/me/connections',
-      method: 'GET',
-      params: {
-        personFields: 'names,phoneNumbers',
-        pageSize: 1000
-      },
-      headers: {
-        'Authorization': `Bearer ${token}`
-      }
-    });
-
-    // Process the results
     let formattedContacts = [];
+    let nextPageToken = null;
+    do {
+      // Make the request to Google People API with explicit token in headers
+      const response = await gapi.client.request({
+        path: 'https://people.googleapis.com/v1/people/me/connections',
+        method: 'GET',
+        params: {
+          personFields: 'names,phoneNumbers,photos',
+          pageSize: 1000,
+          ...(nextPageToken ? { pageToken: nextPageToken } : {})
+        },
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
 
-    if (response.result && response.result.connections) {
-      console.log(`Processing ${response.result.connections.length} raw contacts`);
-      
-      // Extract and format contacts with phone numbers
-      formattedContacts = response.result.connections
-        .filter(person => person.phoneNumbers && person.phoneNumbers.length > 0)
-        .map(person => {
-          // Format phone number - keep only digits and ensure it starts with 0 if Israeli number
-          let phone = person.phoneNumbers[0].value.replace(/\D/g, '');
-          if (phone.startsWith('972')) {
-            phone = '0' + phone.substring(3);
-          }
+      // Process the results
+      if (response.result && response.result.connections) {
+        const contacts = response.result.connections
+          .filter(person => person.phoneNumbers && person.phoneNumbers.length > 0)
+          .map(person => {
+            console.log('Processing contact:', {
+              names: person.names,
+              phoneNumbers: person.phoneNumbers,
+              photos: person.photos
+            });
 
-          return {
-            name: person.names && person.names.length > 0 ? person.names[0].displayName : 'ללא שם',
-            phone: phone
-          };
-        });
-      
-      console.log(`Formatted ${formattedContacts.length} contacts with phone numbers`);
-    } else {
-      console.log('No connections found in the response');
-    }
+            // Format phone number - keep only digits and ensure it starts with 0 if Israeli number
+            let phone = person.phoneNumbers[0].value.replace(/\D/g, '');
+            if (phone.startsWith('972')) {
+              phone = '0' + phone.substring(3);
+            }
 
+            // Get the best available name
+            let displayName = 'ללא שם';
+            if (person.names && person.names.length > 0) {
+              const name = person.names[0];
+              if (name.displayName) {
+                displayName = name.displayName;
+              } else if (name.givenName && name.familyName) {
+                displayName = `${name.givenName} ${name.familyName}`;
+              } else if (name.givenName) {
+                displayName = name.givenName;
+              } else if (name.familyName) {
+                displayName = name.familyName;
+              }
+            }
+
+            // Get profile photo or create avatar from first letter
+            let avatar = null;
+            if (person.photos && person.photos.length > 0) {
+              avatar = person.photos[0].url;
+            } else if (displayName !== 'ללא שם') {
+              // Create avatar from first letter of name
+              const firstLetter = displayName.charAt(0).toUpperCase();
+              avatar = `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(firstLetter)}&backgroundColor=4f46e5&textColor=ffffff`;
+            } else {
+              // Fallback avatar for unknown contacts
+              avatar = 'https://api.dicebear.com/7.x/avataaars/svg?seed=unknown';
+            }
+
+            return {
+              name: displayName,
+              phone: phone,
+              avatar: avatar
+            };
+          });
+
+        formattedContacts = formattedContacts.concat(contacts);
+        console.log(`Fetched ${contacts.length} contacts from this page`);
+      } else {
+        console.log('No connections found in the response');
+      }
+
+      // Get next page token for pagination
+      nextPageToken = response.result.nextPageToken;
+    } while (nextPageToken);
+
+    console.log(`Total formatted contacts: ${formattedContacts.length}`);
+    console.log('Sample formatted contacts:', formattedContacts.slice(0, 3));
     return formattedContacts;
   } catch (error) {
     console.error('Error fetching Google contacts:', error);
-
-    // Check if token is invalid
-    if (error.status === 401 || (error.result && error.result.error && error.result.error.code === 401)) {
-      // Token expired - remove it
-      console.log('Token expired (401), removing token data');
-      await deleteGoogleTokenData();
-    } else if (error.status === 403 || (error.result && error.result.error && error.result.error.code === 403)) {
-      // Permission issue
-      console.log('Permission denied (403), removing token and requesting a new one');
-      await deleteGoogleTokenData();
-    }
-
     return [];
   }
 }

@@ -35,6 +35,8 @@ const googleAuthStatus = ref({
   contactCount: 0
 });
 
+const isLoadingContacts = ref(false);
+
 const handleConversationSelect = (id) => {
   console.log('Selected conversation ID:', id);
 
@@ -134,6 +136,14 @@ async function init() {
 
     await getMessages();
 
+    // הגדרת ערכים ראשוניים ל-localStorage אם לא קיימים
+    if (!localStorage.getItem('lastIncomingMessage')) {
+      localStorage.setItem('lastIncomingMessage', '');
+    }
+    if (!localStorage.getItem('lastOutgoingMessage')) {
+      localStorage.setItem('lastOutgoingMessage', '');
+    }
+
     setInterval(checkNewMessages, 5000);
   }
 }
@@ -143,25 +153,44 @@ async function checkNewMessages() {
     const username = localStorage.getItem('username');
     const password = localStorage.getItem('password');
 
-    const response = await fetch(
+    // בדיקת הודעות נכנסות חדשות
+    const incomingResponse = await fetch(
       `https://www.call2all.co.il/ym/api/GetIncomingSms?token=${username}:${password}&limit=1`
     );
 
-    const data = await response.json();
-    const message = data.rows[0];
+    const incomingData = await incomingResponse.json();
+    const incomingMessage = incomingData.rows[0];
 
-    const lastMessage = localStorage.getItem('lastMessage');
-    if (lastMessage === JSON.stringify(message)) {
-      return;
+    const lastIncomingMessage = localStorage.getItem('lastIncomingMessage');
+    if (lastIncomingMessage !== JSON.stringify(incomingMessage)) {
+      if (incomingMessage) {
+        new Notification(
+          incomingMessage.source.startsWith('972') ? '0' + incomingMessage.source.substring(3) : incomingMessage.source,
+          { body: incomingMessage.message }
+        );
+        localStorage.setItem('lastIncomingMessage', JSON.stringify(incomingMessage));
+      }
     }
 
-    new Notification(
-      message.source.startsWith('972') ? '0' + message.source.substring(3) : message.source,
-      { body: message.message }
+    // בדיקת הודעות יוצאות חדשות
+    const outgoingResponse = await fetch(
+      `https://www.call2all.co.il/ym/api/GetSmsOutLog?token=${username}:${password}&limit=1`
     );
 
-    localStorage.setItem('lastMessage', JSON.stringify(message));
-    await refreshMessages();
+    const outgoingData = await outgoingResponse.json();
+    const outgoingMessage = outgoingData.rows[0];
+
+    const lastOutgoingMessage = localStorage.getItem('lastOutgoingMessage');
+    if (lastOutgoingMessage !== JSON.stringify(outgoingMessage)) {
+      if (outgoingMessage) {
+        localStorage.setItem('lastOutgoingMessage', JSON.stringify(outgoingMessage));
+      }
+    }
+
+    // רענון ההודעות רק אם יש הודעות חדשות
+    if (lastIncomingMessage !== JSON.stringify(incomingMessage) || lastOutgoingMessage !== JSON.stringify(outgoingMessage)) {
+      await refreshMessages();
+    }
   } catch (error) {
     console.error('Error checking for new messages:', error);
   }
@@ -181,14 +210,35 @@ async function getMessages() {
 
     let contacts = {};
 
+    // פונקציה לניקוי פורמט מספר טלפון
+    const normalizePhoneNumber = (phone) => {
+      if (!phone) return '';
+      let clean = phone.replace(/\D/g, '');
+      if (clean.startsWith('972')) {
+        clean = '0' + clean.substring(3);
+      }
+      return clean;
+    };
+
+    isLoadingContacts.value = true;
     const googleContactsResult = await getGoogleContacts();
+    isLoadingContacts.value = false;
 
     if (googleContactsResult.isAuthenticated && googleContactsResult.contacts) {
+      console.log('Processing Google contacts:', googleContactsResult.contacts.length);
       googleContactsResult.contacts.forEach(contact => {
         if (contact.phone && contact.name) {
-          contacts[contact.phone] = contact.name;
+          const cleanPhone = normalizePhoneNumber(contact.phone);
+          contacts[cleanPhone] = {
+            name: contact.name,
+            avatar: contact.avatar
+          };
+          console.log(`Mapped contact: ${contact.phone} -> ${cleanPhone} -> ${contact.name}`);
         }
       });
+      console.log('Final contacts mapping:', Object.keys(contacts).length, 'contacts mapped');
+      console.log('Available contact numbers:', Object.keys(contacts));
+      console.log('Sample contacts:', Object.entries(contacts).slice(0, 5));
 
       googleAuthStatus.value = {
         isAuthenticated: true,
@@ -224,29 +274,41 @@ async function getMessages() {
     const outgoingMsgs = (await outgoing.json()).rows || [];
 
     const incomingMessages = incomingMsgs.map((message) => {
+      console.log('Processing incoming message from:', message.source, 'to:', message.destination);
       const phone = message.source.startsWith('972') ? '0' + message.source.substring(3) : message.source;
+      // עבור הודעות נכנסות, הזיהוי יוצא הוא destination עם החלפת 972 ב-0
+      const callerId = message.destination.startsWith('972') ? '0' + message.destination.substring(3) : message.destination;
       return {
         ...message,
         dest: message.destination,
         phone: phone,
         server_date: message.receive_date,
         type: 'incoming',
-        status: 'DELIVRD'
+        status: 'DELIVRD',
+        callerId: callerId // הוסף את הזיהוי יוצא להודעות נכנסות
       };
     });
 
     const outgoingMessages = outgoingMsgs.map((message) => {
+      console.log('Processing outgoing message to:', message.To, 'from:', message.CallerId);
       return {
         dest: message.CallerId,
         phone: message.To,
         message: message.Message,
         server_date: message.Time,
         status: message.DeliveryReport,
-        type: 'outgoing'
+        type: 'outgoing',
+        callerId: message.CallerId // שמור את הזיהוי יוצא מהודעות יוצאות
       };
     });
 
-    localStorage.setItem('lastMessage', JSON.stringify(incomingMsgs[0]));
+    // שמירת ההודעות האחרונות ב-localStorage
+    if (incomingMsgs.length > 0) {
+      localStorage.setItem('lastIncomingMessage', JSON.stringify(incomingMsgs[0]));
+    }
+    if (outgoingMsgs.length > 0) {
+      localStorage.setItem('lastOutgoingMessage', JSON.stringify(outgoingMsgs[0]));
+    }
     conversations.value = [];
 
     let messages = incomingMessages.concat(outgoingMessages);
@@ -263,6 +325,8 @@ async function getMessages() {
 
     const usedIds = new Set();
 
+    console.log('Conversation phone numbers:', messages.map(m => m.phone).filter((v, i, a) => a.indexOf(v) === i));
+    
     for (let conversation of removeDuplicates(messages, 'phone')) {
       const lastMessageData = messagesBySender[conversation.phone][0];
 
@@ -292,6 +356,7 @@ async function getMessages() {
           avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + message.phone,
           type: message.type,
           status: message.status,
+          callerId: message.callerId, // שמור את הזיהוי יוצא
         };
       });
 
@@ -301,11 +366,69 @@ async function getMessages() {
       }
       usedIds.add(lastMsgUniqueId);
 
+      // ניקוי פורמט המספר לשיחה
+      const cleanConversationPhone = normalizePhoneNumber(conversation.phone);
+      
+      // נסה למצוא התאמה במספרים שונים
+      let contactInfo = contacts[cleanConversationPhone];
+      if (!contactInfo) {
+        // נסה עם 972 במקום 0
+        const with972 = '972' + cleanConversationPhone.substring(1);
+        contactInfo = contacts[with972];
+      }
+      if (!contactInfo) {
+        // נסה עם +972
+        const withPlus972 = '+972' + cleanConversationPhone.substring(1);
+        contactInfo = contacts[withPlus972];
+      }
+      if (!contactInfo) {
+        // נסה למצוא התאמה חלקית - רק 9 הספרות האחרונות
+        const last9Digits = cleanConversationPhone.slice(-9);
+        for (const [phone, info] of Object.entries(contacts)) {
+          if (phone.endsWith(last9Digits)) {
+            contactInfo = info;
+            console.log(`Found partial match: ${phone} matches ${cleanConversationPhone}`);
+            break;
+          }
+        }
+      }
+      if (!contactInfo) {
+        // נסה למצוא התאמה עם מספרים שונים
+        for (const [phone, info] of Object.entries(contacts)) {
+          const normalizedPhone = normalizePhoneNumber(phone);
+          if (normalizedPhone === cleanConversationPhone) {
+            contactInfo = info;
+            console.log(`Found normalized match: ${phone} -> ${normalizedPhone} matches ${cleanConversationPhone}`);
+            break;
+          }
+        }
+      }
+      
+      // קבע את השם והתמונה
+      let contactName = conversation.phone;
+      let contactAvatar = 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + conversation.phone;
+      
+      if (contactInfo) {
+        if (typeof contactInfo === 'string') {
+          // תמיכה בפורמט הישן
+          contactName = contactInfo;
+        } else {
+          // פורמט חדש עם שם ותמונה
+          contactName = contactInfo.name;
+          contactAvatar = contactInfo.avatar;
+        }
+      }
+      
+      console.log(`Creating conversation for ${conversation.phone} (cleaned: ${cleanConversationPhone}): found contact name: ${contactName}`);
+      console.log(`Available contacts for matching:`, Object.keys(contacts));
+      console.log(`Looking for match for: ${cleanConversationPhone}`);
+      console.log(`Contact mapping:`, contacts);
+      
       conversations.value.push({
         id: String(uniqueId),
         contact: conversation.phone,
-        name: contacts[conversation.phone] || conversation.phone,
-        avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + conversation.phone,
+        name: contactName,
+        avatar: contactAvatar,
         lastMessage: {
           id: lastMsgUniqueId,
           sender: lastMessageData.phone,
@@ -319,13 +442,14 @@ async function getMessages() {
           avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + lastMessageData.phone,
           type: lastMessageData.type,
           status: lastMessageData.status,
+          callerId: lastMessageData.callerId, // שמור את הזיהוי יוצא
         },
         messages: msgs,
         unreadCount: msgs.filter((message) => message.type == 'incoming' && message.read == false).length,
       });
     }
 
-    console.log('Created conversations:', conversations.value.map(c => ({ id: c.id, name: c.name })));
+    console.log('Created conversations:', conversations.value.map(c => ({ id: c.id, name: c.name, contact: c.contact })));
 
     window.dispatchEvent(new CustomEvent('googleAuthStatusUpdated'));
   } catch (err) {
@@ -370,6 +494,15 @@ async function login() {
 
       // קבל הודעות וחוזר לשגרה
       await getMessages();
+      
+      // הגדרת ערכים ראשוניים ל-localStorage אם לא קיימים
+      if (!localStorage.getItem('lastIncomingMessage')) {
+        localStorage.setItem('lastIncomingMessage', '');
+      }
+      if (!localStorage.getItem('lastOutgoingMessage')) {
+        localStorage.setItem('lastOutgoingMessage', '');
+      }
+      
       setInterval(checkNewMessages, 5000);
 
     } else {
@@ -536,6 +669,7 @@ async function markAllAsRead() {
       :selected-id="selectedConversationId" @back="selectedConversation = null, selectedConversationId = null" />
 
     <ConversationList :conversations="conversations" :selected-id="selectedConversationId"
+      :is-loading-contacts="isLoadingContacts"
       @select="handleConversationSelect" @refresh-messages="refreshMessages" @filter="filterConversations" 
       @mark-all-as-read="markAllAsRead" />
   </div>
