@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watchEffect, nextTick } from 'vue';
+import { ref, watchEffect, nextTick, computed } from 'vue';
 import { XMarkIcon } from "@heroicons/vue/24/outline";
 import ConversationList from './components/ConversationList.vue';
 import MessageView from './components/MessageView.vue';
@@ -10,6 +10,21 @@ import {
   logoutFromGoogle,
   checkGoogleAuthStatus
 } from './services/google.service';
+import {
+  login as apiLogin,
+  getSession as apiGetSession,
+  getIncomingSms,
+  getSmsOutLog,
+  getTextFile,
+  uploadTextFile,
+  mfaIsPass,
+  mfaTry,
+  mfaGetMethods,
+  mfaSend,
+  mfaValidate,
+  getStoredToken,
+  setStoredToken
+} from './services/api.service';
 
 const openPrivacyPolicy = () => {
   window.openPrivacyPolicy()
@@ -26,6 +41,179 @@ const password = ref('');
 const usernameFocus = ref(false);
 const loading = ref(false);
 const error = ref('');
+
+// MFA + Token state
+const mfaDialogVisible = ref(false);
+const mfaLoading = ref(false);
+const mfaError = ref('');
+const mfaMethods = ref([]);
+const selectedMfaId = ref(null);
+const selectedSendType = ref(null);
+const mfaCode = ref('');
+const rememberMe = ref(true);
+const rememberNote = ref('SMS App');
+const apiToken = ref(getStoredToken());
+const isSessionReady = ref(false);
+let newMessagesIntervalId = null;
+const isMfaStep = ref(false);
+// MFA sub-stages: 'choose' methods grid, or 'code' entry screen
+const mfaStage = ref('choose');
+const mfaSending = ref(false);
+const mfaSentTo = ref({ methodId: null, sendType: null, label: '', destination: '' });
+const mfaCooldownSeconds = ref(0);
+let mfaCooldownTimer = null;
+const mfaValidateDetails = ref(null);
+
+// Only show active methods to avoid empty cards when filtering in template
+const activeMfaMethods = computed(() => (mfaMethods.value || []).filter(m => m.STATUS === 'ACTIVE'));
+// Stable reversed copy (non-mutating) if we ever want reversed order
+const reversedActiveMfaMethods = computed(() => [...activeMfaMethods.value].reverse());
+
+// Dynamic dialog titles/subtitles per stage
+const dialogTitle = computed(() => {
+  if (!isMfaStep.value) return 'התחברות למערכת';
+  return mfaStage.value === 'choose' ? 'שליחת קוד אימות דו שלבי' : 'אימות הקוד';
+});
+
+const dialogSubtitle = computed(() => {
+  if (!isMfaStep.value) return 'הזן את פרטי ההתחברות שלך כדי להתחיל';
+  return mfaStage.value === 'choose'
+    ? 'אנא בחר את הדרך בו תרצה לקבל קוד אימות'
+    : 'אנא הזן את הקוד שקיבלת';
+});
+
+function mfaNikeLabel(method) {
+  const map = {
+    CREATE_PHONE: 'המספר שיצר את המערכת',
+    RESET_MAIL: 'דוא"ל לשחזור',
+    PROFILE: 'הגיע מהפרופיל הקבוע',
+    MASTER_LOGIN: 'התחברות מאסטר של ריסיילר',
+    BY_CUSTOMER: 'נוסף על ידי הלקוח'
+  };
+  return map[method?.NIKE] || method?.NOTE || 'שיטת אימות';
+}
+
+function mfaNikeDescription(method) {
+  // תיאור נוסף אינו נדרש כשכותרת כבר מציגה עברית מלאה, נשאיר רק NOTE במידת הצורך
+  return '';
+}
+
+async function prepareMfa(token) {
+  try {
+    mfaError.value = '';
+    mfaLoading.value = true;
+    await mfaTry(token);
+    const methodsRes = await mfaGetMethods(token);
+    if (methodsRes?.mfaMethods && Array.isArray(methodsRes.mfaMethods)) {
+      mfaMethods.value = methodsRes.mfaMethods;
+      const active = mfaMethods.value.find(m => m.STATUS === 'ACTIVE');
+      selectedMfaId.value = active?.ID ?? null;
+      selectedSendType.value = (active?.SEND_TYPE || [])[0] || null;
+    } else {
+      mfaMethods.value = [];
+    }
+  } catch (e) {
+    console.error('prepareMfa error', e);
+    mfaError.value = 'שגיאה בטעינת אפשרויות האימות';
+  } finally {
+    mfaLoading.value = false;
+  }
+}
+
+async function sendMfaCode(mfaIdParam, sendTypeParam) {
+  try {
+    mfaError.value = '';
+    mfaLoading.value = true;
+    mfaSending.value = true;
+    const token = apiToken.value || getStoredToken();
+    const mfaIdToUse = mfaIdParam ?? selectedMfaId.value;
+    const sendTypeToUse = sendTypeParam ?? selectedSendType.value;
+    if (!mfaIdToUse || !sendTypeToUse) {
+      mfaError.value = 'בחרו שיטה ואופן שליחה';
+      return;
+    }
+    const res = await mfaSend(token, { mfaId: mfaIdToUse, mfaSendType: sendTypeToUse, lang: 'HE' });
+    if (res?.responseStatus !== 'OK') {
+      const msg = res?.message || 'שגיאה בשליחת קוד';
+      mfaError.value = msg;
+      // handle cooldown: "wait 25s"
+      const match = /wait\s+(\d+)s/i.exec(msg);
+      if (match) {
+        mfaCooldownSeconds.value = parseInt(match[1], 10) || 0;
+        if (mfaCooldownTimer) clearInterval(mfaCooldownTimer);
+        if (mfaCooldownSeconds.value > 0) {
+          mfaCooldownTimer = setInterval(() => {
+            if (mfaCooldownSeconds.value > 0) mfaCooldownSeconds.value -= 1;
+            else {
+              clearInterval(mfaCooldownTimer);
+              mfaCooldownTimer = null;
+            }
+          }, 1000);
+        }
+      }
+    } else {
+      // move to code-only stage and remember where we sent it
+      const method = mfaMethods.value.find(x => x.ID === mfaIdToUse);
+      mfaSentTo.value = {
+        methodId: mfaIdToUse,
+        sendType: sendTypeToUse,
+        label: method ? mfaNikeLabel(method) : '',
+        destination: method?.VALUE || ''
+      };
+      mfaStage.value = 'code';
+    }
+  } catch (e) {
+    console.error('sendMfaCode error', e);
+    mfaError.value = 'שגיאה בשליחת קוד';
+  } finally {
+    mfaLoading.value = false;
+    mfaSending.value = false;
+  }
+}
+
+async function validateMfaCode() {
+  try {
+    mfaError.value = '';
+    mfaLoading.value = true;
+    mfaSending.value = true;
+    const token = apiToken.value || getStoredToken();
+    const res = await mfaValidate(token, { mfaCode: mfaCode.value, mfaRememberMe: rememberMe.value, mfaRememberNote: rememberNote.value });
+
+    if (res?.responseStatus === 'OK' && res?.mfa_valid_status === 'VALID') {
+      mfaValidateDetails.value = null;
+      const sessionRes = await apiGetSession(token);
+      if (sessionRes?.responseStatus === 'OK') {
+        mfaDialogVisible.value = false;
+        isMfaStep.value = false;
+        loginDialogVisible.value = false;
+        isSessionReady.value = true;
+        await getMessages();
+        if (!newMessagesIntervalId) newMessagesIntervalId = setInterval(checkNewMessages, 5000);
+      } else {
+        mfaError.value = 'האימות הצליח אך הסשן לא תקין, נסו שוב';
+      }
+    } else if (res?.responseStatus === 'OK' && (res?.mfa_valid_status === 'UNVALID' || res?.mfa_valid_status === 'OVERTRY')) {
+      if (res?.mfa_valid_status === 'OVERTRY') {
+        mfaValidateDetails.value = null;
+        mfaError.value = 'עבר מספר הנסיונות המותר. יש לשלוח קוד חדש.';
+      } else {
+        // UNVALID: show compact message per requirement
+        const left = (res?.mfa_valid_left ?? '').toString();
+        const trys = (res?.mfa_valid_trys ?? '').toString();
+        mfaValidateDetails.value = null;
+        mfaError.value = `קוד האימות שגוי! נותרו לך ${left} ניסיונות | ניסיון ${trys}`;
+      }
+    } else {
+      mfaError.value = res?.mfa_valid_message || 'קוד לא תקין';
+    }
+  } catch (e) {
+    console.error('validateMfaCode error', e);
+    mfaError.value = 'שגיאה באימות הקוד';
+  } finally {
+    mfaLoading.value = false;
+    mfaSending.value = false;
+  }
+}
 
 const setRead = ref(null);
 
@@ -72,17 +260,12 @@ const handleConversationSelect = (id) => {
 
     if (readedArray.length > 0) {
       try {
-        const readedMessagesFetch = await fetch(
-          `https://www.call2all.co.il/ym/api/GetTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:YemotSMSInboxReadedMessages.ini`
-        );
-
-        const readedMessagesRes = await readedMessagesFetch.json();
+        const token = apiToken.value || getStoredToken();
+        const readedMessagesRes = await getTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini');
         let readedMessages = [];
 
         if (readedMessagesRes.message === "file does not exist") {
-          await fetch(
-            `https://www.call2all.co.il/ym/api/UploadTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:YemotSMSInboxReadedMessages.ini&contents=${JSON.stringify(readedArray)}`
-          );
+          await uploadTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini', readedArray);
         } else {
           const readedMessagesData = readedMessagesRes.contents;
           const readedMessagesObj = JSON.parse(readedMessagesData);
@@ -90,17 +273,7 @@ const handleConversationSelect = (id) => {
           readedMessages = readedMessagesObj;
           readedMessages = readedMessages.concat(readedArray);
 
-          await fetch(`https://www.call2all.co.il/ym/api/UploadTextFile`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              token: `${localStorage.getItem('username')}:${localStorage.getItem('password')}`,
-              what: 'ivr2:YemotSMSInboxReadedMessages.ini',
-              contents: JSON.stringify(readedMessages)
-            })
-          });
+          await uploadTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini', readedMessages);
 
           conversations.value = conversations.value.map(conversation => {
             if (conversation.id === id) {
@@ -117,48 +290,75 @@ const handleConversationSelect = (id) => {
 };
 
 async function init() {
-  if (!localStorage.getItem('username') || !localStorage.getItem('password')) {
+  document.title = 'מערכת סמסים';
+
+  // clear any running interval on load
+  if (newMessagesIntervalId) {
+    clearInterval(newMessagesIntervalId);
+    newMessagesIntervalId = null;
+  }
+
+  if (!apiToken.value) {
+    isSessionReady.value = false;
     loginDialogVisible.value = true;
+    isMfaStep.value = false;
+    mfaStage.value = 'choose';
     usernameFocus.value = true;
-  } else {
-    document.title = 'מערכת סמסים - ' + localStorage.getItem('username');
+    return;
+  }
 
-    try {
-      console.log('Checking Google auth status during initialization...');
-      const status = await checkGoogleAuthStatus();
-      googleAuthStatus.value = status;
-      console.log('Initial Google auth status:', status);
-
-      window.dispatchEvent(new CustomEvent('googleAuthStatusUpdated'));
-    } catch (error) {
-      console.error('Error checking Google auth status during init:', error);
+  // Verify token session first
+  try {
+    const sessionRes = await apiGetSession(apiToken.value);
+    if (sessionRes?.responseStatus === 'OK') {
+      isSessionReady.value = true;
+    } else if (sessionRes?.responseStatus === 'FORBIDDEN' && sessionRes?.message === 'MFA_REQUIRED') {
+      isSessionReady.value = false;
+      loginDialogVisible.value = true;
+      isMfaStep.value = true;
+      mfaStage.value = 'choose';
+      await prepareMfa(apiToken.value);
+      return;
+    } else {
+      isSessionReady.value = false;
+      loginDialogVisible.value = true;
+      isMfaStep.value = false;
+      return;
     }
+  } catch (e) {
+    console.error('Session check failed', e);
+    isSessionReady.value = false;
+    loginDialogVisible.value = true;
+    return;
+  }
 
+  try {
+    const status = await checkGoogleAuthStatus();
+    googleAuthStatus.value = status;
+    window.dispatchEvent(new CustomEvent('googleAuthStatusUpdated'));
+  } catch (error) {
+    console.error('Error checking Google auth status during init:', error);
+  }
+
+  if (isSessionReady.value) {
     await getMessages();
-
-    // הגדרת ערכים ראשוניים ל-localStorage אם לא קיימים
     if (!localStorage.getItem('lastIncomingMessage')) {
       localStorage.setItem('lastIncomingMessage', '');
     }
     if (!localStorage.getItem('lastOutgoingMessage')) {
       localStorage.setItem('lastOutgoingMessage', '');
     }
-
-    setInterval(checkNewMessages, 5000);
+    newMessagesIntervalId = setInterval(checkNewMessages, 5000);
   }
 }
 
 async function checkNewMessages() {
   try {
-    const username = localStorage.getItem('username');
-    const password = localStorage.getItem('password');
+    if (!isSessionReady.value) return;
+    const token = apiToken.value || getStoredToken();
 
     // בדיקת הודעות נכנסות חדשות
-    const incomingResponse = await fetch(
-      `https://www.call2all.co.il/ym/api/GetIncomingSms?token=${username}:${password}&limit=1`
-    );
-
-    const incomingData = await incomingResponse.json();
+    const incomingData = await getIncomingSms(token, 1);
     const incomingMessage = incomingData.rows[0];
 
     const lastIncomingMessage = localStorage.getItem('lastIncomingMessage');
@@ -173,11 +373,7 @@ async function checkNewMessages() {
     }
 
     // בדיקת הודעות יוצאות חדשות
-    const outgoingResponse = await fetch(
-      `https://www.call2all.co.il/ym/api/GetSmsOutLog?token=${username}:${password}&limit=1`
-    );
-
-    const outgoingData = await outgoingResponse.json();
+    const outgoingData = await getSmsOutLog(token, 1);
     const outgoingMessage = outgoingData.rows[0];
 
     const lastOutgoingMessage = localStorage.getItem('lastOutgoingMessage');
@@ -198,15 +394,12 @@ async function checkNewMessages() {
 
 async function getMessages() {
   try {
+    if (!isSessionReady.value) return;
     console.log('Getting messages and refreshing data...');
 
-    const incoming = await fetch(
-      `https://www.call2all.co.il/ym/api/GetIncomingSms?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&limit=3000`
-    );
-
-    const outgoing = await fetch(
-      `https://www.call2all.co.il/ym/api/GetSmsOutLog?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&limit=999999`
-    );
+    const token = apiToken.value || getStoredToken();
+    const incomingRes = await getIncomingSms(token, 3000);
+    const outgoingRes = await getSmsOutLog(token, 999999);
 
     let contacts = {};
 
@@ -253,25 +446,19 @@ async function getMessages() {
       };
     }
 
-    const readedMessagesFetch = await fetch(
-      `https://www.call2all.co.il/ym/api/GetTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:YemotSMSInboxReadedMessages.ini`
-    );
-
-    const readedMessagesRes = await readedMessagesFetch.json();
+    const readedMessagesRes = await getTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini');
     let readedMessages = [];
 
     if (readedMessagesRes.message === "file does not exist") {
-      await fetch(
-        `https://www.call2all.co.il/ym/api/UploadTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:YemotSMSInboxReadedMessages.ini&contents=${JSON.stringify([])}`
-      );
+      await uploadTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini', []);
     } else {
       const readedMessagesData = readedMessagesRes.contents;
       const readedMessagesObj = JSON.parse(readedMessagesData);
       readedMessages = readedMessagesObj;
     }
 
-    const incomingMsgs = (await incoming.json()).rows || [];
-    const outgoingMsgs = (await outgoing.json()).rows || [];
+    const incomingMsgs = incomingRes.rows || [];
+    const outgoingMsgs = outgoingRes.rows || [];
 
     const incomingMessages = incomingMsgs.map((message) => {
       console.log('Processing incoming message from:', message.source, 'to:', message.destination);
@@ -468,14 +655,22 @@ async function login() {
   }
 
   try {
-    const response = await fetch(`https://www.call2all.co.il/ym/api/GetSession?token=${username.value}:${password.value}`);
-    const data = await response.json();
+    // Step 1: Login to get token
+    const loginRes = await apiLogin(username.value, password.value);
+    if (!loginRes || !loginRes.token) {
+      throw new Error(loginRes?.message || 'Login failed');
+    }
 
-    if (data.responseStatus === 'OK') {
-      // שמור פרטי התחברות
-      localStorage.setItem('username', username.value);
-      localStorage.setItem('password', password.value);
+    // Store token
+    setStoredToken(loginRes.token);
+    apiToken.value = loginRes.token;
+
+    // Step 2: Check session
+    const sessionRes = await apiGetSession(loginRes.token);
+
+    if (sessionRes?.responseStatus === 'OK') {
       loginDialogVisible.value = false;
+      isSessionReady.value = true;
 
       // האם להחליף את init בתהליך התחברות ספציפי יותר?
       // בדוק סטטוס גוגל לפני קבלת הודעות
@@ -492,8 +687,9 @@ async function login() {
         console.error('Error checking Google status after login:', googleError);
       }
 
-      // קבל הודעות וחוזר לשגרה
+      // Ready
       await getMessages();
+      if (!newMessagesIntervalId) newMessagesIntervalId = setInterval(checkNewMessages, 5000);
       
       // הגדרת ערכים ראשוניים ל-localStorage אם לא קיימים
       if (!localStorage.getItem('lastIncomingMessage')) {
@@ -505,8 +701,15 @@ async function login() {
       
       setInterval(checkNewMessages, 5000);
 
+    } else if (sessionRes?.responseStatus === 'FORBIDDEN' && sessionRes?.message === 'MFA_REQUIRED') {
+      // MFA flow
+      loginDialogVisible.value = true;
+      isSessionReady.value = false;
+      isMfaStep.value = true;
+      mfaStage.value = 'choose';
+      await prepareMfa(loginRes.token);
     } else {
-      error.value = 'שגיאה בהתחברות: ' + data.message;
+      error.value = 'שגיאה בהתחברות: ' + (sessionRes?.message || '');
     }
   } catch (err) {
     error.value = 'שגיאת התחברות. אנא נסה שוב מאוחר יותר.';
@@ -600,18 +803,13 @@ async function markAllAsRead() {
     }
 
     // קבלת ההודעות הנקראות הקיימות
-    const readedMessagesFetch = await fetch(
-      `https://www.call2all.co.il/ym/api/GetTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:YemotSMSInboxReadedMessages.ini`
-    );
-
-    const readedMessagesRes = await readedMessagesFetch.json();
+    const token = apiToken.value || getStoredToken();
+    const readedMessagesRes = await getTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini');
     let readedMessages = [];
 
     if (readedMessagesRes.message === "file does not exist") {
       // אם הקובץ לא קיים, צור אותו עם כל ההודעות הלא נקראות
-      await fetch(
-        `https://www.call2all.co.il/ym/api/UploadTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:YemotSMSInboxReadedMessages.ini&contents=${JSON.stringify(allUnreadMessages)}`
-      );
+      await uploadTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini', allUnreadMessages);
     } else {
       // אם הקובץ קיים, הוסף את ההודעות החדשות
       const readedMessagesData = readedMessagesRes.contents;
@@ -619,17 +817,7 @@ async function markAllAsRead() {
       readedMessages = readedMessages.concat(allUnreadMessages);
 
       // עדכן את הקובץ עם כל ההודעות הנקראות
-      await fetch(`https://www.call2all.co.il/ym/api/UploadTextFile`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          token: `${localStorage.getItem('username')}:${localStorage.getItem('password')}`,
-          what: 'ivr2:YemotSMSInboxReadedMessages.ini',
-          contents: JSON.stringify(readedMessages)
-        })
-      });
+      await uploadTextFile(token, 'ivr2:YemotSMSInboxReadedMessages.ini', readedMessages);
     }
 
     // עדכן את כל השיחות מקומית - אפס את מונה ההודעות הלא נקראות
@@ -682,7 +870,16 @@ async function markAllAsRead() {
       class="fixed inset-0 bg-gray-900 bg-opacity-50 flex justify-center items-center z-50 p-4"
       style="backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);">
 
-      <div class="bg-white p-8 rounded-xl shadow-xl w-full max-w-md" @click.stop>
+      <div class="bg-white p-8 rounded-xl shadow-xl w-full max-w-3xl relative" @click.stop>
+        <div v-if="mfaSending" class="absolute inset-0 bg-white bg-opacity-80 flex items-center justify-center z-10">
+          <div class="flex flex-col items-center gap-3">
+            <svg class="animate-spin h-8 w-8 text-indigo-600" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+            </svg>
+            <div class="text-sm text-gray-700">שולח/מאמת מול השרת...</div>
+          </div>
+        </div>
         <div class="flex flex-col items-center mb-6">
           <div class="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mb-4">
             <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-indigo-600" fill="none" viewBox="0 0 24 24"
@@ -691,15 +888,15 @@ async function markAllAsRead() {
                 d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
             </svg>
           </div>
-          <h3 class="text-2xl font-bold text-gray-800">התחברות למערכת</h3>
-          <p class="text-gray-500 mt-1 text-center">הזן את פרטי ההתחברות שלך כדי להתחיל</p>
+          <h3 class="text-2xl font-bold text-gray-800">{{ dialogTitle }}</h3>
+          <p class="text-gray-500 mt-1 text-center">{{ dialogSubtitle }}</p>
         </div>
 
         <div v-if="error" class="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">
           {{ error }}
         </div>
 
-        <div class="space-y-4">
+        <div v-if="!isMfaStep" class="space-y-4">
           <label for="username"
             class="relative block overflow-hidden rounded-lg border border-gray-200 px-3 pt-3 shadow-sm focus-within:border-indigo-600 focus-within:ring-1 focus-within:ring-indigo-600 transition-colors cursor-text">
             <input v-model="username" type="text" id="username" placeholder="מה מספר המערכת שלך?"
@@ -742,6 +939,197 @@ async function markAllAsRead() {
           <div class="text-sm text-center pt-2 text-indigo-600">
             <span class="hover:underline cursor-pointer" @click="openPrivacyPolicy">מדיניות פרטיות</span>
           </div>
+        </div>
+
+        <!-- MFA Step inside the same dialog -->
+        <div v-else class="space-y-5">
+          <template v-if="mfaStage === 'choose'">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div v-for="m in reversedActiveMfaMethods" :key="m.ID"
+                 class="rounded-xl border p-4 shadow-sm transition-colors border-gray-200 hover:border-gray-300">
+              <div class="flex items-center justify-between mb-1">
+                <div class="font-semibold text-gray-800">{{ mfaNikeLabel(m) }} <br>  <div v-if="m.NOTE" class="text-xs text-gray-500 mb-3">{{ m.NOTE }}</div>
+              </div>
+                <div class="flex items-center gap-2">
+                  <span class="text-[11px] px-2 py-0.5 rounded text-green-700 bg-green-100">{{ m.TYPE == 'PHONE' ? 'טלפון' : m.TYPE == 'EMAIL' ? 'דוא"ל' : m.TYPE }} פעיל</span>
+                </div>
+              </div>
+
+              <div class="text-gray-700 text-sm mb-3" style="direction: ltr; text-align: center;">{{ m.VALUE }}</div>
+
+              <div class="flex items-center gap-2 text-xs text-gray-500 mb-3">
+                <span v-if="m.LAST_USED" class="px-2 py-0.5 rounded bg-gray-100 text-gray-700">
+                  שומש לאחרונה: 
+                  {{
+                    (() => {
+                      // Expect m.LAST_USED format to be "YYYY-MM-DD HH:mm:ss"
+                      if (!m.LAST_USED) return '';
+                      const [datePart, timePart] = m.LAST_USED.split(' ');
+                      if (!datePart || !timePart) return m.LAST_USED;
+                      const [y, mon, d] = datePart.split('-');
+                      const [h, min] = timePart.split(':');
+                      return `${d}/${mon}/${y} ${h}:${min}`;
+                    })()
+                  }}
+                </span>
+                <span v-if="m.EXPIRED_DATE" class="px-2 py-0.5 rounded bg-red-100 text-red-700">
+                  פג: 
+                  {{
+                    (() => {
+                      // Expect m.EXPIRED_DATE format to be "YYYY-MM-DD HH:mm:ss" or "YYYY-MM-DD" at least
+                      const dateStr = (m.EXPIRED_DATE || '').split(' ')[0];
+                      if (!dateStr) return '';
+                      const [y, m2, d] = dateStr.split('-');
+                      return `${d}/${m2}/${y}`;
+                    })()
+                  }}
+                </span>
+              </div>
+            
+              <div class="flex flex-wrap gap-2">
+                <button v-for="t in (m.SEND_TYPE || [])" :key="t" @click.stop="sendMfaCode(m.ID, t)" :disabled="mfaCooldownSeconds > 0 || mfaSending"
+                        :class="[
+                          'px-3 py-1.5 rounded-lg text-sm text-white',
+                          t === 'SMS' ? 'bg-indigo-600 hover:bg-indigo-500' :
+                          t === 'CALL' ? 'bg-blue-600 hover:bg-blue-500' :
+                          'bg-emerald-600 hover:bg-emerald-500'
+                        ]">
+                  <span v-if="mfaSending" class="inline-flex items-center">
+                    <svg class="animate-spin h-4 w-4 mr-2" viewBox="0 0 24 24">
+                      <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                      <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    שולח...
+                  </span>
+                  <span v-else>
+                    <template v-if="mfaCooldownSeconds > 0">המתינו {{ mfaCooldownSeconds }}s</template>
+                    <template v-else>
+                      <span v-if="t === 'SMS'">שליחת קוד בהודעת סמס</span>
+                      <span v-else-if="t === 'CALL'">שליחת קוד בשיחה</span>
+                      <span v-else-if="t === 'EMAIL'">שליחת קוד למייל</span>
+                      <span v-else>{{ t }}</span>
+                    </template>
+                  </span>
+                </button>
+              </div>
+            </div>
+         
+          </div>
+          <div class="flex items-center gap-2">
+              <input id="remember2" type="checkbox" v-model="rememberMe" />
+              <label for="remember2" class="text-sm text-gray-700">שמירת החיבור ל-30 יום (זכור אותי)</label>
+            </div>
+          </template>
+          <template v-else>
+          <div class="space-y-3">
+              <div v-if="mfaError" class="p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">
+                {{ mfaError }}
+              </div>
+              <div v-if="mfaValidateDetails" class="p-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg text-sm">
+                <div><strong>סטטוס:</strong> {{ mfaValidateDetails.status }}</div>
+                <div v-if="mfaValidateDetails.trys !== undefined"><strong>ניסיונות שבוצעו:</strong> {{ mfaValidateDetails.trys }}</div>
+                <div v-if="mfaValidateDetails.left !== undefined"><strong>ניסיונות שנותרו:</strong> {{ mfaValidateDetails.left }}</div>
+                <div v-if="mfaValidateDetails.message"><strong>הסבר:</strong> {{ mfaValidateDetails.message }}</div>
+              </div>
+              <div class="text-sm text-gray-600">
+              נשלח קוד ל־
+              <span class="font-semibold">{{ mfaSentTo.label }}</span>
+              <span class="px-2">•</span>
+                <span class="font-mono" style="direction: ltr; unicode-bidi: plaintext;">{{ mfaSentTo.destination }}</span>
+              <span class="px-2">•</span>
+              <span class="uppercase">{{ mfaSentTo.sendType }}</span>
+            </div>
+            <label class="block text-sm text-gray-700">הזינו את הקוד</label>
+            <input v-model="mfaCode" type="text" class="w-full border rounded-lg px-3 py-2" @keydown.enter="validateMfaCode" />
+            <div class="flex items-center gap-2">
+              <input id="remember2" type="checkbox" v-model="rememberMe" />
+              <label for="remember2" class="text-sm text-gray-700">שמירת החיבור ל-30 יום (זכור אותי)</label>
+            </div>
+            <div class="flex gap-2">
+              <button :disabled="mfaLoading || !mfaCode" @click="validateMfaCode" class="flex-1 transition-all px-4 py-3 text-white bg-green-500 hover:bg-green-600 rounded-lg shadow-sm font-medium">אימות והמשך</button>
+              <button :disabled="mfaLoading" @click="sendMfaCode(mfaSentTo.methodId, mfaSentTo.sendType)" class="px-4 py-3 text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg shadow-sm font-medium">שליחה מחדש</button>
+              <button :disabled="mfaLoading" @click="mfaStage = 'choose'; mfaCode = ''" class="px-4 py-3 text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg shadow-sm font-medium">בחירת שיטה אחרת</button>
+            </div>
+          </div>
+          <!-- שמירת תיאור (מוסתר) -->
+          <div class="hidden"><input v-model="rememberNote" type="text" class="w-full border rounded-lg px-3 py-2" /></div>
+          </template>
+        </div>
+      </div>
+    </div>
+  </transition>
+
+  <!-- MFA Dialog -->
+  <transition name="fade">
+    <div v-if="mfaDialogVisible"
+      class="fixed inset-0 bg-gray-900 bg-opacity-50 flex justify-center items-center z-50 p-4"
+      style="backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);">
+
+      <div class="bg-white p-8 rounded-xl shadow-xl w-full max-w-md" @click.stop>
+        <div class="flex flex-col items-center mb-6">
+          <div class="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mb-4">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-indigo-600" fill="none" viewBox="0 0 24 24"
+              stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M12 11c0-1.657-1.343-3-3-3S6 9.343 6 11v1H5a2 2 0 00-2 2v3h10v-3a2 2 0 00-2-2h-1v-1z" />
+            </svg>
+          </div>
+          <h3 class="text-2xl font-bold text-gray-800">אימות דו שלבי</h3>
+          <p class="text-gray-500 mt-1 text-center">בחרו שיטת אימות, שלחו קוד ואשרו</p>
+        </div>
+
+        <div v-if="mfaError" class="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">
+          {{ mfaError }}
+        </div>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-sm text-gray-700 mb-1">שיטת אימות</label>
+            <select v-model="selectedMfaId" class="w-full border rounded-lg px-3 py-2">
+              <option v-for="m in mfaMethods" :key="m.ID" :value="m.ID">
+                {{ m.NIKE || 'שיטה' }} - {{ m.STATUS }}
+              </option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-sm text-gray-700 mb-1">אופן שליחה</label>
+            <select v-model="selectedSendType" class="w-full border rounded-lg px-3 py-2">
+              <option v-for="t in (mfaMethods.find(x => x.ID === selectedMfaId)?.SEND_TYPE || [])" :key="t" :value="t">
+                {{ t }}
+              </option>
+            </select>
+          </div>
+
+          <div class="flex gap-2">
+            <button :disabled="mfaLoading || !selectedMfaId || !selectedSendType" @click="sendMfaCode" :class="[
+              mfaLoading ? 'bg-opacity-70 cursor-not-allowed' : 'hover:bg-indigo-500',
+              'transition-all w-full px-4 py-3 text-white bg-indigo-600 rounded-lg shadow-sm font-medium'
+            ]">
+              שליחת קוד
+            </button>
+          </div>
+
+          <div>
+            <label class="block text-sm text-gray-700 mb-1">הזינו את הקוד</label>
+            <input v-model="mfaCode" type="text" class="w-full border rounded-lg px-3 py-2" @keydown.enter="validateMfaCode" />
+          </div>
+
+          <div class="flex items-center gap-2">
+            <input id="remember" type="checkbox" v-model="rememberMe" />
+            <label for="remember" class="text-sm text-gray-700">שמירת החיבור ל-30 יום (זכור אותי)</label>
+          </div>
+
+          <div>
+            <input v-model="rememberNote" type="text" class="w-full border rounded-lg px-3 py-2" placeholder="תיאור לזיהוי (אופציונלי)" />
+          </div>
+
+          <button :disabled="mfaLoading || !mfaCode" @click="validateMfaCode" :class="[
+            mfaLoading ? 'bg-opacity-70 cursor-not-allowed' : 'hover:bg-green-600',
+            'transition-all w-full px-4 py-3 text-white bg-green-500 rounded-lg shadow-sm font-medium'
+          ]">
+            אימות והמשך
+          </button>
         </div>
       </div>
     </div>

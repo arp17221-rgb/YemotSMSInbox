@@ -41,10 +41,11 @@ const filteredCallerIds = computed(() => {
 // פונקציה לקבלת פרטי לקוח
 const loadCustomerData = async () => {
   try {
+    const { getStoredToken } = await import('../services/api.service');
+    const token = getStoredToken();
     const response = await fetch(
-      `https://www.call2all.co.il/ym/api/GetCustomerData?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}`
+      `https://www.call2all.co.il/ym/api/GetCustomerData?token=${encodeURIComponent(token)}`
     );
-    
     const data = await response.json();
     
     if (data.responseStatus === 'OK') {
@@ -109,11 +110,11 @@ const loadCallerIds = async () => {
   try {
     // טען את פרטי הלקוח
     await loadCustomerData();
-    
+    const { getStoredToken } = await import('../services/api.service');
+    const token = getStoredToken();
     const response = await fetch(
-      `https://www.call2all.co.il/ym/api/GetApprovedCallerIDs?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}`
+      `https://www.call2all.co.il/ym/api/GetApprovedCallerIDs?token=${encodeURIComponent(token)}`
     );
-    
     const data = await response.json();
     
     if (data.responseStatus === 'OK') {

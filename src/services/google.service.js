@@ -382,13 +382,15 @@ export async function saveGoogleTokenData(userData) {
     const dataAsString = JSON.stringify(userData);
 
     // Upload to server
+    const { getStoredToken } = await import('./api.service');
+    const token = getStoredToken();
     const response = await fetch(`https://www.call2all.co.il/ym/api/UploadTextFile`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        token: `${localStorage.getItem('username')}:${localStorage.getItem('password')}`,
+        token,
         what: 'ivr2:GoogleToken.txt',
         contents: dataAsString
       })
@@ -415,8 +417,10 @@ export async function getGoogleTokenData() {
     console.log('Retrieving Google token data');
 
     // Get data from server
+    const { getStoredToken } = await import('./api.service');
+    const token = getStoredToken();
     const response = await fetch(
-      `https://www.call2all.co.il/ym/api/GetTextFile?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&what=ivr2:GoogleToken.txt`
+      `https://www.call2all.co.il/ym/api/GetTextFile?token=${encodeURIComponent(token)}&what=ivr2:GoogleToken.txt`
     );
 
     if (!response.ok) {

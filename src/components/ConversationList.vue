@@ -194,17 +194,11 @@ async function sendNewMessage() {
   loading.value = true;
 
   try {
-    // בנה את ה-URL עם הזיהוי יוצא
-    let url = `https://www.call2all.co.il/ym/api/SendSms?token=${localStorage.getItem('username')}:${localStorage.getItem('password')}&phones=${phoneToSend.value}&message=${messageToSend.value}`;
-    
-    // הוסף את הזיהוי יוצא אם נבחר
-    if (selectedCallerId.value) {
-      url += `&from=${selectedCallerId.value}`;
-    }
-
-    const response = await fetch(url);
-
-    const data = await response.json();
+    const { getStoredToken, sendSms } = await import('../services/api.service');
+    const token = getStoredToken();
+    const params = { phones: phoneToSend.value, message: messageToSend.value };
+    if (selectedCallerId.value) params.from = selectedCallerId.value;
+    const data = await sendSms(token, params);
 
     if (data.responseStatus === 'OK') {
       emit('refreshMessages');
