@@ -131,49 +131,6 @@ const verifyCode = async () => {
   }
 };
 
-const verifyCode = async () => {
-  if (!verificationCode.value) {
-    error.value = 'אנא הזן את קוד האימות';
-    return;
-  }
-
-  loading.value = true;
-  error.value = '';
-
-  try {
-    const response = await fetch('https://www.call2all.co.il/ym/api/ValidationCallerId', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        token: getStoredToken(),
-        action: 'valid',
-        reId: reqId.value,
-        code: verificationCode.value
-      })
-    });
-
-    const data = await response.json();
-
-    if (data.responseStatus === 'OK' && data.status === true) {
-      step.value = 'success';
-      success.value = 'הזיהוי יוצא נוסף בהצלחה!';
-      setTimeout(() => {
-        emit('success');
-        closeModal();
-      }, 2000);
-    } else {
-      error.value = data.message || 'קוד האימות שגוי';
-    }
-  } catch (err) {
-    error.value = 'שגיאה בחיבור לשרת';
-    console.error('Error verifying code:', err);
-  } finally {
-    loading.value = false;
-  }
-};
-
 const closeModal = () => {
   step.value = 'input';
   callerId.value = '';
