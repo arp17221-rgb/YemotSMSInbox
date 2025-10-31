@@ -41,18 +41,23 @@ const sendVerification = async () => {
 
   loading.value = true;
   error.value = '';
-
-  // ניקוי המספר
-  let cleanCallerId = callerId.value.replace(/\s/g, '').replace(/-/g, '');
+  const cleanCallerId = callerId.value.replace(/\s/g, '').replace(/-/g, '');
 
   try {
+    const { getStoredToken } = await import('../services/api.service');
+    const token = getStoredToken();
+
+    if (!token) {
+      error.value = 'לא נמצא טוקן. אנא התחבר מחדש.';
+      loading.value = false;
+      return;
+    }
+
     const response = await fetch('https://www.call2all.co.il/ym/api/ValidationCallerId', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        token: `${localStorage.getItem('username')}:${localStorage.getItem('password')}`,
+        token,
         action: 'send',
         callerId: cleanCallerId,
         validType: validType.value
@@ -86,13 +91,63 @@ const verifyCode = async () => {
   error.value = '';
 
   try {
+    const { getStoredToken } = await import('../services/api.service');
+    const token = getStoredToken();
+
+    if (!token) {
+      error.value = 'לא נמצא טוקן. אנא התחבר מחדש.';
+      loading.value = false;
+      return;
+    }
+
+    const response = await fetch('https://www.call2all.co.il/ym/api/ValidationCallerId', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token,
+        action: 'valid',
+        reId: reqId.value,
+        code: verificationCode.value
+      })
+    });
+
+    const data = await response.json();
+
+    if (data.responseStatus === 'OK' && data.status === true) {
+      step.value = 'success';
+      success.value = 'הזיהוי יוצא נוסף בהצלחה!';
+      setTimeout(() => {
+        emit('success');
+        closeModal();
+      }, 2000);
+    } else {
+      error.value = data.message || 'קוד האימות שגוי';
+    }
+  } catch (err) {
+    error.value = 'שגיאה בחיבור לשרת';
+    console.error('Error verifying code:', err);
+  } finally {
+    loading.value = false;
+  }
+};
+
+const verifyCode = async () => {
+  if (!verificationCode.value) {
+    error.value = 'אנא הזן את קוד האימות';
+    return;
+  }
+
+  loading.value = true;
+  error.value = '';
+
+  try {
     const response = await fetch('https://www.call2all.co.il/ym/api/ValidationCallerId', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        token: `${localStorage.getItem('username')}:${localStorage.getItem('password')}`,
+        token: getStoredToken(),
         action: 'valid',
         reId: reqId.value,
         code: verificationCode.value
