@@ -35,22 +35,25 @@ const isValidCallerId = computed(() => {
 
 const sendVerification = async () => {
   if (!isValidCallerId.value) {
-    error.value = 'אנא הזן מספר טלפון תקין';
-    return;
+    error.value = 'אנא הזן מספר טלפון תקין'
+    return
   }
 
-  loading.value = true;
-  error.value = '';
-  const cleanCallerId = callerId.value.replace(/\s/g, '').replace(/-/g, '');
+  loading.value = true
+  error.value = ''
+  const cleanCallerId = callerId.value.replace(/\s/g, '').replace(/-/g, '')
 
   try {
-    const { getStoredToken } = await import('../services/api.service');
-    const token = getStoredToken();
+    const { getStoredToken } = await import('../services/api.service')
+    const token = getStoredToken()
+
+    console.log('[TOKEN] Value:', token) // ← בדיקה
 
     if (!token) {
-      error.value = 'לא נמצא טוקן. אנא התחבר מחדש.';
-      loading.value = false;
-      return;
+      error.value = 'לא נמצא טוקן. אנא התחבר מחדש.'
+      console.error('[ERROR] No token found')
+      loading.value = false
+      return
     }
 
     const response = await fetch('https://www.call2all.co.il/ym/api/ValidationCallerId', {
@@ -62,42 +65,46 @@ const sendVerification = async () => {
         callerId: cleanCallerId,
         validType: validType.value
       })
-    });
+    })
 
-    const data = await response.json();
+    const data = await response.json()
+    console.log('[API RESPONSE]', data)
 
     if (data.responseStatus === 'OK') {
-      reqId.value = data.reqId;
-      step.value = 'verification';
-      success.value = `קוד אימות נשלח ל${validType.value === 'SMS' ? 'הודעת SMS' : 'שיחת טלפון'} למספר ${callerId.value}`;
+      reqId.value = data.reqId
+      step.value = 'verification'
+      success.value = `קוד אימות נשלח ל${validType.value === 'SMS' ? 'הודעת SMS' : 'שיחת טלפון'} למספר ${callerId.value}`
     } else {
-      error.value = data.message || 'שגיאה בשליחת קוד האימות';
+      error.value = data.message || 'שגיאה בשליחת קוד האימות'
     }
   } catch (err) {
-    error.value = 'שגיאה בחיבור לשרת';
-    console.error('Error sending verification:', err);
+    console.error('[FETCH ERROR]', err)
+    error.value = err.message.includes('fetch') ? 'אין חיבור לשרת (CORS/רשת)' : 'שגיאה בחיבור: ' + err.message
   } finally {
-    loading.value = false;
+    loading.value = false
   }
-};
+}
 
 const verifyCode = async () => {
   if (!verificationCode.value) {
-    error.value = 'אנא הזן את קוד האימות';
-    return;
+    error.value = 'אנא הזן את קוד האימות'
+    return
   }
 
-  loading.value = true;
-  error.value = '';
+  loading.value = true
+  error.value = ''
 
   try {
-    const { getStoredToken } = await import('../services/api.service');
-    const token = getStoredToken();
+    const { getStoredToken } = await import('../services/api.service')
+    const token = getStoredToken()
+
+    console.log('[TOKEN] Value:', token) // ← בדיקה
 
     if (!token) {
-      error.value = 'לא נמצא טוקן. אנא התחבר מחדש.';
-      loading.value = false;
-      return;
+      error.value = 'לא נמצא טוקן. אנא התחבר מחדש.'
+      console.error('[ERROR] No token found')
+      loading.value = false
+      return
     }
 
     const response = await fetch('https://www.call2all.co.il/ym/api/ValidationCallerId', {
@@ -109,28 +116,28 @@ const verifyCode = async () => {
         reId: reqId.value,
         code: verificationCode.value
       })
-    });
+    })
 
-    const data = await response.json();
+    const data = await response.json()
+    console.log('[API RESPONSE]', data)
 
     if (data.responseStatus === 'OK' && data.status === true) {
-      step.value = 'success';
-      success.value = 'הזיהוי יוצא נוסף בהצלחה!';
+      step.value = 'success'
+      success.value = 'הזיהוי יוצא נוסף בהצלחה!'
       setTimeout(() => {
-        emit('success');
-        closeModal();
-      }, 2000);
+        emit('success')
+        closeModal()
+      }, 2000)
     } else {
-      error.value = data.message || 'קוד האימות שגוי';
+      error.value = data.message || 'קוד האימות שגוי'
     }
   } catch (err) {
-    error.value = 'שגיאה בחיבור לשרת';
-    console.error('Error verifying code:', err);
+    console.error('[FETCH ERROR]', err)
+    error.value = err.message.includes('fetch') ? 'אין חיבור לשרת (CORS/רשת)' : 'שגיאה בחיבור: ' + err.message
   } finally {
-    loading.value = false;
+    loading.value = false
   }
-};
-
+}
 const closeModal = () => {
   step.value = 'input';
   callerId.value = '';
